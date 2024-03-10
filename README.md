@@ -30,7 +30,7 @@ For detailed information about the dataset, including structure and features, vi
 
 - **Stage 0 Analysis**: Establish a baseline model performance using initial-stage data.
 - **Incremental Data Integration**: Gradually incorporate data from Stages 1 and 2.
-- **Adaptive Weighted Scoring**: Implement a dynamic scoring mechanism.
+- **Adaptive Weighted Scoring**: Implement a dynamic scoring mechanism for the loss function.
 
 ---
 
