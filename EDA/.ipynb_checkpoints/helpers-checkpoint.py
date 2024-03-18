@@ -8,7 +8,7 @@ def change_column_type(df: pl.DataFrame)->pl.DataFrame:
         # Column type determined by last letter
         if col[-1] in ("P", "A"):
             transforms.append(pl.col(col).cast(pl.Float64).alias(col))
-        elif col[-1] in ("D"):  # Use 'elif' to ensure mutual exclusivity
+        elif col[-1] in ("D") or col == 'date_decision':  # Use 'elif' to ensure mutual exclusivity
             transforms.append(pl.col(col).cast(pl.Date).alias(col))
     
     if transforms:
@@ -56,18 +56,31 @@ def group_and_sort_columns(df: pd.DataFrame):
 
     return list(sorted_groups.items())
 
-# Pandas converter
-def pl_to_pd_subset(pl_df, columns):
-    ''' Converts a set of polars dataframe to pandas dataframe'''
-    # check columns exist
-    missing_col = [col for col in columns if not in pl_df.columns]
-    if missing_col:
-        raise ValueError(f"The following columns are not in the DataFrame: {missing_columns}")
-
-    # Select only the specified columns
-    subset_pl_df = pl_df.select(columns)
-
-    # Convert the selected subset to a Pandas DataFrame
-    subset_pd_df = subset_pl_df.to_pandas()
-
-    return subset_pd_df
+# converts rows into comma seperated text
+def row_to_string(row_info, col_types, col_names)->str:
+    row_str = []
+    idx = 0
+    
+    for value, dtype, name in zip(row_info, col_types, col_names):
+        if idx == 0:
+            idx += 1
+            continue
+        elif idx == len(col_types)-1:
+            break
+        idx+=1    
+        msg = f"{name} is empty"         
+        if isinstance(dtype, (pl.Int64, pl.Float64)):
+            if value is not None:
+                msg = f"{name} has value" 
+        elif isinstance(dtype, pl.String):
+            if value is not None:
+                msg = f"{name} value is {value}"
+        elif isinstance(dtype, pl.Date):
+            if value is not None:
+                msg = f"{name}: {str(value)}"
+        elif isinstance(dtype, pl.Boolean):
+            if value is not None:
+                msg = f"{name} is {value}"            
+        row_str.append(msg)
+        
+    return ", ".join(row_str) 
