@@ -1,407 +1,314 @@
 from collections import Counter
-import numpy as np
-from typing import List, Pattern, Dict, Tuple
+from typing import List, Pattern, Dict, Tuple, Any
+from tqdm import tqdm
+from dataclasses import dataclass, field
+from functools import lru_cache
 import regex as re
+import numpy as np
 import math
 import string
 import pickle
 import os
+import nltk
+from nltk.corpus import words
+from .load_and_batch import MetaData
+
+nltk.download("words")
+
+common_words = set(words.words())
 
 
-class BytePairEncodeAlgo:
+# use dataclass here
+@dataclass
+class BpeArgs:
+    pattern: Pattern[str] = None  # matching pattern
+    # for interquartile range outlier measure
+    IQR_Mult: float = 1.5
+    # for better outlier prediction
+    IQR_Iter: int = 5
+    # checks for opportunities to include rare words that bring context
+    doc_thresh: int = 100
+    # controls the potential final context window after compressing
+    target_context: int = -1
+    # controls the total vocab size
+    max_vocab_size: int = -1
+    # Where to store or load information post
+    store_loc: str = ""
+    # List of special tokens to be included
+    adhoc_tokens: List[str] = field(default_factory=list)
+    # Special words that aren't key tags but should be included
+    adhoc_words: List[str] = field(default_factory=list)
+
+
+class TokCollector:
+    """
+    A class to collect and manage tokens, supporting operations like
+    frequency counting, threshold updating, and bounds calculation using IQR.
+    """
+
     def __init__(
-        self,
-        pattern: Pattern[str] = re.compile(""),
-        IQr_Mult: float = 1.5,
-        IQR_Iter: int = 5,
-        compression_ratio: float = 0.5,
+        self, IQR_Mult: float = 1.5, IQR_Iter: int = 5, add_freq: bool = False
     ):
-        """Used to create mappings for words and builds a word vocabulary
-
-        Args:
-            pattern (Pattern[str]): regex pattern for matching strings
-            IQr_Mult (float, optional):
-                used for finding outliers in merged_pairs. Defaults to 1.5.
-            IQR_Iter (int, optional):
-                number of iterations to find outliers. Defaults to 5.
-            compression_ratio (float, optional):
-                how much the encoder compresses the text. Defaults to 0.5.
-        """
-        # public attributes
-        self.match_pattern = (
-            pattern if pattern.pattern != "" else self.__default_pattern()
-        )
-        self.IQr_Mult = IQr_Mult
+        self.IQR_Mult = IQR_Mult
         self.IQR_Iter = IQR_Iter
-        self.storage_ratio = 1 - compression_ratio
+        self.vocab = Counter()
+        self.mapping = {}
+        self.__vthresh_updated = True
+        self.min_vocab_threshold = float("-inf")
 
-        # private attributes
-        self.__curr_tokenized = []  # Holds the current tokenized text
-        self.__byte_pair_mapping = {}  # Maps byte-pairs to unique IDS
-        self.__vocab = Counter()  # Frequency counter for bytes
-        self.__merged_pairs = Counter()  # Holder for word pairs
-        self.__doc_merged_pairs_freq = Counter()  # Holder for word freq
-        self.__next_id = 256  # "Utf-8"
-        self.__doc_count = 0
-        self.__tok_track = set()
+        self.freq = Counter() if add_freq else None
+        self.__fthresh_updated = True if add_freq else False
+        self.min_freq_threshold = float("-inf") if add_freq else None
 
-    def __default_pattern(self):
-        # grab all possible puctuations
-        escaped_punctuation = "".join(
-            "\\" + char if char in ".^$*+?{}[]\\|()" else char
-            for char in string.punctuation
+    def add(self, new_token: Any):
+        self.__vthresh_updated = False
+        self.vocab[new_token] += 1
+
+    def sub(self, token: Any, val: int = 1):
+        self.__vthresh_updated = False
+        if token in self.vocab:
+            self.vocab[token] -= val
+
+    def update_freq(self, new_token: Any):
+        if self.freq is not None:
+            self.__fthresh_updated = False
+            self.freq[new_token] += 1
+
+    @property
+    def empty_vocab(self) -> bool:
+        return len(self.vocab) == 0
+
+    @property
+    def empty_freq(self) -> bool:
+        return len(self.freq) == 0 if self.freq is not None else True
+
+    @property
+    def vocab_len(self) -> int:
+        return len(self.vocab)
+
+    @property
+    def freq_len(self) -> int:
+        return len(self.freq) if self.freq is not None else 0
+
+    def get_vocab_bounds(self) -> Tuple[float, float]:
+        # Uses IQR to find outliers
+        return self.iterative_filtering(
+            np.array(list(self.vocab.values())), is_vocab=True
         )
 
-        pattern = re.compile(
-            r"""
-            # Case-insensitive matching
-            (?i)
-            # Dates in YYYY-MM-DD format
-            \d{4}-\d{2}-\d{2}|
-            # Enhanced alphanumeric with specific formats
-            \b\w+_\d+[A-Z]?\b|
-            # Specific keywords
-            \b(?:has|value|is|empty|true|false|active\scontract|closed\scontract)\b|
-            # Uppercase identifiers including numbers and underscores, not preceded by whitespace
-            \b[A-Z0-9_]+(?<!\s)\b|
-            # Match words with optional trailing punctuation
-            \b\p{L}+(?:'\p{L}+)*\b(?:[{}]+)?|
-            # Match whole numbers with optional trailing punctuation
-            \b\p{N}+\b(?:[{}]+)?|
-            # Monetary values, including optional $
-            \$?\d+(?:,\d{3})*(?:\.\d+)?(?:[KMBT])?\b|
-            # Match any character not a space, letter, or number
-            [^\s\p{L}\p{N}]+|
-            # Spaces
-            \s+(?!\S)|\s+|"""
-            + rf"[{escaped_punctuation}]+|"
-            + "",
-            re.VERSION1 | re.VERBOSE | re.IGNORECASE,
-        )
+    def update_vocab_thresh(self) -> None:
+        if not self.__vthresh_updated:
+            sorted_data = np.sort(np.array(list(self.vocab.values())))
+            self.min_vocab_threshold = self.median_ext(sorted_data)
+            self.__vthresh_updated = True
 
-        return pattern
-
-    def get_current_tokenized(self):
-        return self.__curr_tokenized
-
-    def get_vocabulary(self):
-        return self.__vocab
-
-    def get_vocab_length(self):
-        # this length is used as information in the embedding phase.
-        return len(self.__vocab)
-
-    def encode_text(self, text: str, verbose: bool = False) -> List[int]:
-        """Converts characters in the strings to byters and
-            compresses them with known popular merged pairs
-
-        Args:
-            text (str): text to turn to numbers
-
-        Returns:
-            List[int]: Tokenized and encoded text
-        """
-        tok_list = self.__byte_tokenizer(text)
-
-        if verbose:
-            msg = f"Length of Tokens {len(tok_list)}"
-            print(f"Pre Merge: \n{tok_list}\n{msg}\n{'=' * len(msg)}\n")
-
-        tok_list = self.__merge_known_pairs(tok_list)
-        if verbose:
-            msg = f"Length of Tokens {len(tok_list)}"
-            print(f"Post Merge: \n{tok_list}\n{msg}\n{'=' * len(msg)}\n")
-
-        return tok_list
-
-    def decode(self, token_list: List[int]) -> str:
-        """
-        Decodes a list of tokens into the original text.
-
-        Args:
-            token_list (List[int]): The list of tokens to decode.
-
-        Returns:
-            str: The decoded original text.
-        """
-
-        # __byte_pair_mapping stores [pair -> token] we need the reverse
-        reverse_map = {v: k for k, v in self.__byte_pair_mapping.items()}
-
-        # decode each token to original character
-        byte_array = []
-        for token in token_list:
-            byte_array.extend(self.__token_decoder(token, reverse_map))
-
-        return bytes(byte_array).decode("utf-8")
-
-    def __token_decoder(
-        self, token: int, reverse_bpm: Dict[int, Tuple[int, int]]
-    ) -> List[int]:
-        """Breaks down tokens to encoded range
-
-        Args:
-            token (int): current token to decode
-            reverse_bpm (Dict[int,Tuple[int, int]]):
-                dictionary that maps token -> merged pair
-
-        Returns:
-            List[int]: decoded list
-        """
-        if token <= 255:
-            return [token]
-
-        # The token gives the pair
-        pair_rep = reverse_bpm.get(token)
-        if not pair_rep:
-            raise ValueError(
-                f"Token {token} not found in reverse map.\
-                Check byte_pair_mapping"
+    def get_freq_bounds(self) -> Tuple[float, float]:
+        if self.freq is not None:
+            return self.iterative_filtering(
+                np.array(list(self.freq.values())), is_vocab=False
             )
+        return [-1, -1]
 
-        decoded = []
-        # recursive call to decode till we get to where we can call utf-8
-        for val in pair_rep:
-            decoded.extend(self.__token_decoder(val, reverse_bpm))
+    def update_freq_thresh(self) -> None:
+        if self.freq is not None and not self.__fthresh_updated:
+            sorted_data = np.sort(np.array(list(self.freq.values())))
+            self.min_freq_threshold = self.median_ext(sorted_data)
+            self.__fthresh_updated = True
 
-        return decoded
+    def median_ext(self, sorted_data: np.array):
+        n = len(sorted_data)
+        return (
+            (sorted_data[n // 2 - 1] + sorted_data[n // 2]) / 2
+            if n % 2 == 0
+            else sorted_data[n // 2]
+        )
 
-    def __byte_tokenizer(self, text: str) -> List[int]:
-        """Converts string to list of tokens
+    def iterative_filtering(
+        self, data: np.array, is_vocab: bool = True
+    ) -> Tuple[float, float]:
 
-        Args:
-            text (str): text to convert
+        sorted_data = np.sort(data)
+        # check if any discriminative numbers
+        if sorted_data[0] == sorted_data[-1]:
+            return [-1, -1]
 
-        Returns:
-            list[int]: List of tokens
-        """
-        line_matches = self.match_pattern.findall(text)
-        tok_list = []
-        # update current encoded line
-        for word in line_matches:
-            tok_list.extend(word.encode("utf-8"))
+        # update the minimum threshold
+        if is_vocab:
+            self.min_vocab_threshold = self.median_ext(sorted_data)
+            self.__vthresh_updated = True
+        elif self.freq is not None:
+            self.min_freq_threshold = self.median_ext(sorted_data)
+            self.__fthresh_updated = True
 
-        return tok_list
+        for _ in range(self.IQR_Iter):
+            n = len(sorted_data)
 
-    def __merge_known_pairs(self, tok_list: List[int]) -> List[int]:
-        """Scans and swaps already found pairs
+            Q1, Q3 = np.percentile(sorted_data, [25, 75])
 
-        Args:
-            tok_list (list[int]): list of tokens.
-        Returns:
-            List[int]: New tokenized array.
-        """
-        if not self.__byte_pair_mapping:
-            return tok_list
+            IQR = Q3 - Q1
+            lower_bound_q = Q1 - self.IQR_Mult * IQR
+            upper_bound_q = Q3 + self.IQR_Mult * IQR
 
-        while True:
-            new_tok_list = []
-            new_merge = False
-            idx = 0
+            filtered_data = sorted_data[
+                (sorted_data >= lower_bound_q) & (sorted_data <= upper_bound_q)
+            ]
 
-            while idx < len(tok_list):
-                # Check if we're at a point where a pair can be checked
-                if idx < len(tok_list) - 1:
-                    pair = (tok_list[idx], tok_list[idx + 1])
-
-                    if pair in self.__byte_pair_mapping:
-                        new_tok_list.append(self.__byte_pair_mapping[pair])
-                        idx += 2  # Skip the next index as it's been merged
-                        new_merge = True
-                        continue
-
-                new_tok_list.append(tok_list[idx])
-                idx += 1
-
-            tok_list = new_tok_list
-
-            # Exit the while loop if no new merges occurred in this pass
-            if not new_merge:
+            if len(filtered_data) == n:
                 break
 
-        return tok_list
+            sorted_data = filtered_data
 
-    def __update_vocab(self, tok_list: List[int]):
-        # at this stage tok_list has the latest mappings
-        curr_pair_track = set()
+        return lower_bound_q, upper_bound_q
 
-        for idx in range(len(tok_list)):
-            current_token = tok_list[idx]
-            pair = (current_token,)
-            # Update the count for the current token
-            if pair not in self.__tok_track:
-                curr_pair_track.add(pair)
-                self.__vocab[current_token] += 1
+    def update_mappings(
+        self, item: Tuple[Tuple[int, int], int], token_id: int, freq_count: int = 0
+    ):
+        self.mapping[item[0]] = token_id
+        self.vocab[token_id] = item[1]
 
-            # Update the count for the pair (current and next token)
-            if idx < len(tok_list) - 1:
-                next_token = tok_list[idx + 1]
-                token_pair = (current_token, next_token)
+        if self.freq is not None:
+            self.freq[item[0]] = freq_count
 
-                if token_pair not in self.__tok_track:
-                    # updating stuff properly
-                    self.__merged_pairs[token_pair] += 1
-                    if token_pair not in curr_pair_track:
-                        self.__doc_merged_pairs_freq[token_pair] += 1
+    def remove_presence(self, key: Tuple[int, int]):
+        # handles removal of key and prunes the list as-well
+        if key in self.vocab:
+            del self.vocab[key]
 
-                    # Tracking document count
-                    curr_pair_track.add(token_pair)
+        for c_pair in list(self.vocab.keys()):
+            if c_pair[0] == key[1] or c_pair[1] == key[0]:
+                self.vocab[c_pair] -= 1
 
-        # update __tok_track
-        for pair in curr_pair_track:
-            self.__tok_track.add(pair)
+                # Check if we prune current pair
+                if self.vocab[c_pair] <= 0:
+                    del self.vocab[c_pair]
 
-    def process(self, text: str, verbose: bool = False):
-        """Process for compressing
+                    if self.freq and c_pair in self.freq:
+                        del self.freq[c_pair]
 
-        Args:
-            text (str): text to compress
-            verbose (bool, optional):
-                prints out run analysis. Defaults to False.
-        """
-        self.__doc_count += 1
+        # Remove the current key we inserted previously
+        if self.freq and key in self.freq:
+            del self.freq[key]
 
-        tok_list = self.__byte_tokenizer(text)
-        original_size = len(tok_list)
+    def tf_idf_dict(self, doc_size: int, total_words: int) -> Dict[Any, float]:
+        if self.freq:
+            tf_idf_track = {}
+            for pair, count in self.freq.items():
+                if count > 0:
+                    idf = math.log10(doc_size / count)
+                    tf_idf = (count / total_words) * idf
+                    if tf_idf > 0:
+                        tf_idf_track[pair] = tf_idf
+            return tf_idf_track
+        return {}
 
-        new_list = self.__merge_known_pairs(tok_list)
-        curr_size = len(new_list)
+    def clear(self):
+        self.vocab.clear()
+        self.mapping.clear()
 
-        self.__tok_track.clear()
+        if self.freq is not None:
+            self.freq.clear()
 
-        # repeat process till we hit the compression ratio
-        while curr_size > self.storage_ratio * original_size:
 
-            self.__update_vocab(new_list)
+#######################################################################
+class Encoder:
+    # Uses BPE to encode text from a polars table
+    __base_chars = 255
+    __next_id = __base_chars
 
-            self.__update_mappings()
-
-            new_list = self.__merge_known_pairs(new_list)
-
-            if curr_size == len(new_list):
-                break
-
-            curr_size = len(new_list)
-
-        # complete the calculation
-        if verbose and original_size != len(new_list):
-            self.run_analysis(tok_list, new_list)
-
-        # place holder if necessary
-        self.__curr_tokenized = new_list
-
-    def __vocab_tf_idf(self):
-        tf_idf_track = {}
-        total_pairs = len(self.__merged_pairs)
-        for pair, count in self.__merged_pairs.items():
-            freq = self.__doc_merged_pairs_freq[pair]
-
-            idf = math.log10(self.__doc_count / freq)
-            tf_idf_track[pair] = (count / total_pairs) * idf
-
-        # use to trim the document
-        return tf_idf_track
-
-    def __update_mappings(self):
-        # here is where we add new to the list here is where I update byte_pair
-        if not self.__vocab:
+    def __init__(self, args: BpeArgs = None) -> None:
+        if args is None:
+            print("Empty instantiation. Ensure to load from pickle file location")
             return
 
-        tf_idf_dict = self.__vocab_tf_idf()
-        freqs = np.array(list(tf_idf_dict.values()))
+        """Types of tokens"""
+        # special tokens [token: count]
+        self.__special = TokCollector(args.IQR_Mult, args.IQR_Iter, add_freq=True)
+        self.__init_special(args.adhoc_tokens)
+        self.__update_special_toks(args.adhoc_words)
 
-        res = self.iterative_filtering(
-            freqs, multiplier=self.IQr_Mult, max_iter=self.IQR_Iter
+        # base single ascii characters [token: count]
+        self.__base = TokCollector(args.IQR_Mult, args.IQR_Iter, add_freq=True)
+        # base paired characters [token: count]
+        self.__paired = TokCollector(args.IQR_Mult, args.IQR_Iter, add_freq=True)
+        self.__init_paired()
+        # potential tokens [(token, token): count]
+        self.__potential = TokCollector(args.IQR_Mult, args.IQR_Iter, add_freq=True)
+
+        self.__target_context = args.target_context
+        self.__store_loc = args.store_loc
+        self.__max_vocab_size = args.max_vocab_size
+        # Trackers
+        self.__doc_count = 0
+        self.__total_words = 0
+        self.__run_pair_track = set()
+
+        self.__pattern = (
+            args.pattern
+            if args.pattern is not None
+            else self.__default_pattern(self.__special.mapping)
         )
 
-        # updating merged pair information
-        if res[0] > 0 or res[1] > 0:
-            self.__update_with_iqr(res, tf_idf_dict)
-        # else:
-        # self.__upper_per_update(np.quantile(freqs, 0.75), tf_idf_dict)
+        self.__loaded = False
 
-    def __update_with_iqr(
-        self, bounds: Tuple[float, float], tf_idf_dict: Dict[Tuple[int, int], float]
-    ):
-        """Uses IQR value to filter:
-            - irrelvant information if less than lower bound
-            - pairs that should be included in the vocabulary
+    def __update_special_toks(self, special_list: List[str]) -> None:
+        if len(special_list) == 0:
+            return
 
-        Args:
-            bounds (List[float, float]):
-                lower and upper bounds for filtering process
-            tf_idf_dict: Dict[Tuple[int, int], float]
-                TF_IDF for each merged pair
-        """
-        # gets median of main vocabulary. This is used as a threshold
-        freqs = np.array(list(self.__vocab.values()))
-        min_threshold = np.quantile(freqs, 0.5)
+        for spec_tok in special_list:
+            # create [char -> tokens]
+            if spec_tok not in self.__special.mapping:
+                self.__special.mapping[spec_tok] = self.__next_id
+                self.__special.vocab[self.__next_id] = 0
+                self.__next_id += 1
 
-        for key, tf_idf in tf_idf_dict.items():
-            if bounds[1] > 0 and tf_idf > bounds[1]:
-                # adding to vocab list
-                if (
-                    self.__vocab[key[0]] >= min_threshold
-                    and self.__vocab[key[1]] >= min_threshold
-                ):
-                    self.__byte_pair_mapping[key] = self.__next_id
-                    self.__vocab[self.__next_id] = 0
-                    self.__next_id += 1
-                    del self.__merged_pairs[key]
+    def add_special_words(self, words: List[str]):
+        self.__update_special_toks(words)
 
-            elif bounds[0] > 0 and tf_idf <= bounds[0]:
-                del self.__merged_pairs[key]
+    def __init_special(self, toks: List[str]):
+        base = ["<|AMOUNT|>", "<|NUM|>", "<|DATE|>", "<|SOW|>", "<|EOW|>", "<|PAD|>"]
 
-    def __upper_per_update(self, val: float, tf_idf_dict: Dict[Tuple[int, int], float]):
-        """Gets all matched pairs with counts > val
+        # ammend new list to base
+        if len(toks) > 0:
+            collect = set(base)
+            [collect.add(f"<|{val}|>") for val in toks]
+            base = list(collect)
 
-        Args:
-            val (float): Threshold for extracting
-            tf_idf_dict: Dict[Tuple[int, int], float]
-                TF_IDF for each merged pair
-        """
-
-        # gets median of main vocabulary. This is used as a threshold
-        freqs = np.array(list(self.__vocab.values()))
-        min_threshold = np.quantile(freqs, 0.5)
-
-        for key, tf_idf in tf_idf_dict.items():
-            if tf_idf > val:
-                # adding to vocab list
-                if (
-                    self.__vocab[key[0]] >= min_threshold
-                    and self.__vocab[key[1]] >= min_threshold
-                ):
-                    self.__byte_pair_mapping[key] = self.__next_id
-                    self.__vocab[self.__next_id] = 0
-                    self.__next_id += 1
-                    del self.__merged_pairs[key]
+        # updates special mapping
+        self.__update_special_toks(base)
 
     @staticmethod
-    def iterative_filtering(data: list, multiplier=1.5, max_iter=10):
-        # using IQR to filter data
-        lower_bound = -1
-        upper_bound = -1
+    def __default_pattern(key_tags: Dict[str, int]):
+        """Automatically inclueds special tokens into matched patterns
 
-        for _ in range(max_iter):
-            Q1 = np.quantile(data, 0.25)
-            Q3 = np.quantile(data, 0.75)
-            IQR = Q3 - Q1
+        Args:
+            special_tokens (List[str]): word patterns to include
+        """
+        special_word_pattern = "|".join(
+            re.escape(word) for word in list(key_tags.keys())
+        )
+        base_pattern = r'"<\|[^|]*\|>"|\b\w+\b(?:[!?.,;:]?)|[\w]+[_][\w]+|(?<!\s)[A-Z0-9_]+|\s+|[^a-zA-Z0-9\s]'
 
-            lower_bound_q = Q1 - multiplier * IQR
-            upper_bound_q = Q3 + multiplier * IQR
+        pattern = f"{special_word_pattern}|{base_pattern}"
+        return re.compile(pattern, re.IGNORECASE)
 
-            # Filter data
-            filtered_data = [x for x in data if lower_bound_q <= x <= upper_bound_q]
+    def __init_paired(self) -> None:
+        # all possible begining of word and end of word characters
+        characters = string.ascii_letters + string.digits
+        for char in characters:
+            idx = list(char.encode("utf-8"))[0]
+            mapped_char = (self.__special.mapping["<|SOW|>"], idx)
 
-            if len(filtered_data) == len(data):
-                lower_bound = lower_bound_q
-                upper_bound = upper_bound_q
-                break
+            self.__paired.mapping[mapped_char] = self.__next_id
+            self.__paired.vocab[self.__next_id] = 0
+            self.__next_id += 1
 
-            data = filtered_data
+            mapped_char = (idx, self.__special.mapping["<|EOW|>"])
+            self.__paired.mapping[mapped_char] = self.__next_id
+            self.__paired.vocab[self.__next_id] = 0
+            self.__next_id += 1
 
-        return [lower_bound, upper_bound]
+    def update_context_length(self, context_length: int):
+        self.__target_context = context_length
 
     def run_analysis(
         self, original_list: List[int], new_list: List[int], disp: bool = True
@@ -409,7 +316,7 @@ class BytePairEncodeAlgo:
         original_unique = np.unique(np.array(original_list))
         new_unique = np.unique(np.array(new_list))
         compression_ratio = (
-            len(new_list) / len(original_list)
+            1 - (len(new_list) / len(original_list))
             if len(original_list) != len(new_list)
             else 0
         )
@@ -421,7 +328,15 @@ class BytePairEncodeAlgo:
             ("Length of compressed list", len(new_list)),
             ("Number of unique tokens in compressed", len(new_unique)),
             ("Final compression ratio", f"{compression_ratio:.3f} "),
+            ("Length of vocabulary", self.vocab_size),
         ]
+
+        if not self.__loaded:
+            rows += [
+                ("Length of vocabulary", self.vocab_size),
+                ("Total documents seen so far", self.__doc_count),
+                ("Total words seen so far", self.__total_words),
+            ]
 
         # Find the longest row label
         longest_label_length = max(len(label) for label, _ in rows)
@@ -452,6 +367,327 @@ class BytePairEncodeAlgo:
 
         return output
 
+    @property
+    def vocab_size(self):
+        # returns the total length
+        return (
+            self.__base.vocab_len + self.__paired.vocab_len + self.__special.vocab_len
+        )
+
+    def word_to_code(self, text: str):
+        if text in self.__special.mapping:
+            return [self.__special.mapping[text]]
+
+        return list(text.encode("utf-8"))
+
+    def word_to_tokens(self, text: str, verbose: bool = False) -> List[int]:
+        # these we encode simply
+        skip_pattern = re.compile(
+            rf"[{re.escape(string.punctuation)}$\*\+?\{{\}}\[\]\\|()]"
+        )
+        tokens, verbose_str = [], []
+        for word in self.__pattern.findall(text):
+            if (
+                word.isspace()
+                or len(list(word)) == 1
+                or word in self.__special.mapping
+                or skip_pattern.match(word) is not None
+            ):
+                tokens.extend(self.word_to_code(word))
+
+                if verbose:
+                    verbose_str.append(word)
+                continue
+
+            inner_split = word.split(" ")
+            to_join, to_join_a = [], []
+
+            for single_word in inner_split:
+                # tokenize common words seperately
+                if single_word.lower() in common_words:
+                    self.__update_special_toks([single_word])
+                    to_join.append(self.__special.mapping[single_word])
+                    to_join_a.append(single_word)
+                    continue
+
+                # tokenize
+                to_join.extend(self.word_to_code("<|SOW|>"))
+                to_join.extend(self.word_to_code(single_word))
+                to_join.extend(self.word_to_code("<|EOW|>"))
+
+                # for verbose purposes
+                to_join_a.extend(["<|SOW|>" + single_word + "<|EOW|>"])
+
+            # extending tokens
+            tokens.extend(to_join)
+            if verbose:
+                verbose_str.extend(to_join_a)
+
+        if verbose:
+            print(verbose_str)
+
+        return tokens
+
+    def __merge_known_pairs(self, tok_list: List[int]) -> List[int]:
+        """Keeps iterating until we've reduced the list to the smallest based on paired vocab
+
+        Args:
+            tok_list (List[int]): New tokens to compress
+
+        Returns:
+            List[int]: compressed tokens
+        """
+        if self.__paired.empty_vocab:
+            return tok_list
+
+        # iterate till no more pairs
+        while True:
+            new_list = []
+            changed = False
+            idx = 0
+
+            while idx < len(tok_list):
+                if idx + 1 < len(tok_list):
+                    pair = (tok_list[idx], tok_list[idx + 1])
+
+                    token = self.__paired.mapping.get(pair, None)
+                    if token is not None:
+                        new_list.append(token)
+                        changed = True
+                        idx += 2
+                    else:
+                        new_list.append(tok_list[idx])
+                        idx += 1
+
+                else:
+                    # append last if not paired
+                    new_list.append(tok_list[idx])
+                    idx += 1
+
+            # break if no changes
+            if not changed:
+                break
+
+            # update
+            tok_list = new_list
+
+        return tok_list
+
+    def __update_indv_tok_freq(self, token: int):
+        # update the token frequency
+        if token <= 255:
+            self.__base.add(token)
+            return
+
+        if token in self.__special.vocab:
+            self.__special.add(token)
+            return
+
+        self.__paired.add(token)
+
+    def __update_doc_tok_freq(self, token: int):
+        # update the document frequency
+        if token <= 255:
+            self.__base.update_freq(token)
+            return
+
+        if token in self.__special.vocab:
+            self.__special.update_freq(token)
+            return
+
+        self.__paired.update_freq(token)
+
+    def __update_vocab(self, tok_list: List[int]) -> None:
+        """
+        Updates individual frequency and number of documents token appears
+        Also starts process for forming new pairs
+
+        Args:
+            tok_list (List[int]): List ot tokens to be updated
+        """
+        loop_track = set()
+        list_length = len(tok_list)
+
+        for idx, curr_tok in enumerate(tok_list):
+            pair = (curr_tok,)
+
+            # Handling existing tokens
+            if pair not in self.__run_pair_track:
+                self.__update_indv_tok_freq(curr_tok)
+
+                if pair not in loop_track:
+                    self.__update_doc_tok_freq(curr_tok)
+
+                loop_track.add(pair)
+
+            # Avoid merging special tokens.. easy for identifying later
+            if (
+                curr_tok in self.__special.vocab
+                or tok_list[idx + 1] in self.__special.vocab
+            ):
+                continue
+
+            tok_pair = (curr_tok, tok_list[idx + 1]) if idx < list_length - 1 else None
+            if tok_pair is not None and tok_pair not in self.__run_pair_track:
+                self.__potential.add(tok_pair)  # update pair frequency
+
+                if tok_pair not in loop_track:  # update pair document frequency
+                    self.__potential.update_freq(tok_pair)
+
+                loop_track.add(tok_pair)
+
+        # update run pair track to be used in next loop
+        self.__run_pair_track.update(loop_track)
+
+    def __update_info(self, new_info: List[Tuple[int, int]], count: int = 1):
+        for key in new_info:
+            # update paired
+            self.__paired.update_mappings(
+                (key, count), self.__next_id, self.__potential.freq[key]
+            )
+
+            self.__next_id += 1
+
+            # remove or decrement presence
+            self.__potential.remove_presence(key)
+
+    def get_count(self, token: int) -> int:
+        # returns count of token
+        if token <= 255:
+            return self.__base.vocab[token]
+
+        count = self.__special.vocab.get(token, None)
+        if count is not None:
+            return count
+
+        count = self.__paired.vocab.get(token, None)
+        if count is not None:
+            return count
+
+        return 0
+
+    def __bpe_update_scheme(self):
+        if self.__potential.empty_vocab:
+            return
+
+        # Find the maximum count directly
+        max_count = self.__potential.vocab.most_common(1)[0][1]
+
+        if max_count == 1:
+            return
+
+        to_process = [
+            pair for pair, count in self.__potential.vocab.items() if count == max_count
+        ]
+
+        # Refine by number of times root elements appear, if needed
+        if len(to_process) > 1:
+            root_counts = [
+                (pair, self.get_count(pair[0]) + self.get_count(pair[1]))
+                for pair in to_process
+            ]
+            max_root = max(root_counts, key=lambda x: x[1])[1]
+            to_process = [
+                pair for pair, root_sum in root_counts if root_sum == max_root
+            ]
+
+        # Ensure unique pairs if there are multiple candidates
+        if len(to_process) > 1:
+            unique_pairs = []
+            unique_toks = set()
+
+            for pair in to_process:
+                if pair[0] not in unique_toks and pair[1] not in unique_toks:
+                    unique_pairs.append(pair)
+                    unique_toks.update(pair)
+
+            to_process = unique_pairs
+
+        # Now we update the information real-time
+        self.__update_info(to_process, max_count)
+
+    def get_token(self, pair: Tuple[int, int]) -> int:
+        if len(pair) == 1:
+            return pair[0]
+        else:
+            tok = self.__paired.mapping.get(pair, None)
+            if tok is not None:
+                return tok
+
+        return -1
+
+    def compute_score(self, tok: int):
+        # given a token we compute the tf-idf and likelihood
+        indv_freq, doc_freq = -1.0, -1.0
+
+        if tok <= 255:
+            indv_freq = self.__base.vocab.get(tok, -1.0)
+            doc_freq = self.__base.freq.get(tok, -1.0)
+
+        elif tok in self.__special.vocab:
+            indv_freq = self.__special.vocab.get(tok, -1.0)
+            doc_freq = self.__special.freq.get(tok, -1.0)
+
+        else:
+            indv_freq = self.__paired.vocab.get(tok, -1.0)
+            doc_freq = self.__paired.freq.get(tok, -1.0)
+
+        if indv_freq == -1.0 or doc_freq == -1.0:
+            return [indv_freq, doc_freq]
+
+        prob = indv_freq / self.__total_words
+
+        idf = math.log10(self.__doc_count / doc_freq)
+        tf_idf = prob * idf
+
+        return [prob, tf_idf]
+
+    def process(self, text: str, encode_only: bool = False, verbose: bool = False):
+        tok_list = self.word_to_tokens(text, False)
+        new_list = self.__merge_known_pairs(tok_list)
+
+        if encode_only:
+            if verbose:
+                self.run_analysis(tok_list, new_list)
+
+            return new_list
+
+        curr_size = len(new_list)
+
+        self.__doc_count += 1
+        self.__total_words += curr_size
+        # These help track results per run
+        self.__run_pair_track.clear()
+        self.__potential.clear()
+
+        while True:
+            # if merged version already fits the context window
+            if self.__target_context > 0 and curr_size <= self.__target_context:
+                break
+
+            self.__update_vocab(new_list)
+            self.__bpe_update_scheme()
+            new_list = self.__merge_known_pairs(new_list)
+
+            # no further improvements can be made
+            if curr_size == len(new_list):
+                break
+
+            curr_size = len(new_list)
+
+        if verbose:
+            self.run_analysis(tok_list, new_list)
+
+    def encode_text(self, text: str, verbose: bool = False):
+        encoded = self.process(text, encode_only=True, verbose=verbose)
+
+        if len(encoded) < self.__target_context:
+            num_add = self.__target_context - len(encoded)
+            for _ in range(0, num_add):
+                encoded.append(self.__special.mapping["<|PAD|>"])
+
+        return encoded
+
     def save_state(self, location: str):
         directory = os.path.join(location, "BPE_Info")
         if not os.path.exists(directory):
@@ -467,106 +703,43 @@ class BytePairEncodeAlgo:
             with open(filepath, "rb") as file:
                 state = pickle.load(file)
                 self.__dict__.update(state)
+
+            self.__loaded = True
         else:
             print("No saved state found at the specified location.")
 
-    def test(self, txt: str = ""):
-        if not txt:
-            txt = "On 2024-03-13, the project 'GeoData_Analysis_2024' officially"
-            txt += " kicked off.The team had previously discussed several key points,"
-            txt += (
-                " emphasizing the importance of accuracy and efficiency. As of today,"
-            )
-            txt += (
-                " there have been 152 issues logged, with 47 marked as 'resolved' and"
-            )
-            txt += " the remaining awaiting review. Interestingly, the budget allocated for"
-            txt += (
-                " this phase is 3,450,000.2456, which is under it's $3.5M cap suggested"
-            )
-            txt += " in the initial proposal."
+    def compress_files(
+        self,
+        metas: List[MetaData],
+        save_or_update_every: int = 20,
+    ):
+        total_lines = len(metas)
+        prev_per = 0
 
-        out_msg = f"\nOrginal_text: \n{txt}\n"
-        out_msg += "\nRunning script to encode\n"
-        self.process(txt, False)
+        with tqdm(total=total_lines, desc="Overall Progress") as pbar:
+            for meta in metas:
+                pbar.update(1)
 
-        out_msg += "\nEncoding the Text\n"
-        orig_list = self.__byte_tokenizer(txt)
-        msg = f"Length of Tokens {len(orig_list)}"
-        out_msg += f"Pre Merge: \n{orig_list}\n{msg}\n{'=' * len(msg)}\n"
+                # greedy processing
+                self.process(meta.text, verbose=False)
 
-        tok_list = self.__merge_known_pairs(orig_list)
-        msg = f"Length of Tokens {len(tok_list)}"
-        out_msg += f"Post Merge: \n{tok_list}\n{msg}\n{'=' * len(msg)}\n"
+                curr_per = int(100 * (pbar.n / total_lines))
+                if curr_per % save_or_update_every == 0 and curr_per != prev_per:
+                    print(f"Length of vocab: {self.vocab_size}")
+                    self.save_state(self.__store_loc)
+                    prev_per = curr_per
 
-        out_msg += f"\n{self.run_analysis(orig_list, tok_list, False)}\n"
+                # Check if maximum vocabulary size is reached
+                if (
+                    self.__max_vocab_size != -1
+                    and self.vocab_size >= self.__max_vocab_size
+                ):
+                    print(f"Maximum Vocabulary Size: {self.vocab_size} reached.")
+                    break
 
-        out_msg += "\nTesting decoder\n"
-        final_string = self.decode(tok_list)
+            # Save state after each file is processed
+            self.save_state(self.__store_loc)
 
-        out_msg += f"Decoded String: \n{final_string}\n============== \n"
-        out_msg += f"Matched Original?: {txt==final_string}"
-
-        msg = f"Length of vocabulary {len(self.__vocab)}"
-        out_msg += f"\n{msg}\n{'=' * len(msg)}\n"
-
-        return out_msg
-
-
-def main():
-    operation = BytePairEncodeAlgo(
-        pattern=re.compile(""), IQr_Mult=1.5, IQR_Iter=5, compression_ratio=0.5
-    )
-
-    print(operation.test())
-
-    print("\n")
-    txt = "In the midst of a sprawling desert, a hidden oasis thrived,"
-    txt += " sheltered by towering dunes. At the heart of this verdant "
-    txt += "sanctuary lay an ancient tree, its roots entwined with the very "
-    txt += "essence of the land. Legends whispered of its creation, born from "
-    txt += "the tears of a celestial being, granting it the power to sustain life "
-    txt += "in the barren expanse. Travelers, drawn by tales of its mystical allure, "
-    txt += "ventured across the arid wilderness, hoping to uncover its secrets. As the sun "
-    # dipped below the horizon, casting a golden glow, the oasis revealed its true splendor, becoming a beacon of hope and serenity in the vast, unyielding desert."
-    print(operation.test(txt))
-
-    txt = "In the midst of a sprawling desert, a hidden oasis thrived,"
-    txt += " sheltered by towering dunes. At the heart of this verdant "
-    txt += "sanctuary lay an ancient tree, its roots entwined with the very "
-    txt += "essence of the land. Legends whispered of its creation, born from "
-    txt += "the tears of a celestial being, granting it the power to sustain life "
-    txt += "in the barren expanse. Travelers, drawn by tales of its mystical allure, "
-    txt += "ventured across the arid wilderness, hoping to uncover its secrets. As the sun "
-    txt += "dipped below the horizon, casting a golden glow, the oasis revealed its true splendor, becoming a beacon of hope and serenity in the vast, unyielding desert."
-    print(operation.test(txt))
-
-    random_text = """
-        Hello World! 12345
-        Special characters: ~!@#$%^&*()
-        Python is great for data analysis.
-        'Let's use single quotes within a string.'
-        "Double quotes can also be used."
-        New line starts here.
-        The quick brown fox jumps over the lazy dog.
-        123 + 456 = 579
-        Escape sequences: \t (tab), \n (new line)
-        End of string.
-        """
-    print(operation.test(random_text))
-
-    sample_text = """
-        Once upon a time, in a land far, far away, there lived a coder named Alex.
-        42 is the answer to life, the universe, and everything.
-        Favorite symbols: @, #, $, %, ^, &, and *.
-        Alex said, "Learning Python is fun!"
-        Use \\ to escape a backslash, \n for newline, and \t for tab.
-        Math in strings: 8 * 6 = 48
-        Random characters: α, β, γ, δ, ε, ζ, η, θ
-        End of sample text.
-        """
-    print(operation.test(sample_text))
-
-
-if __name__ == "__main__":
-    main()
+            # Final save state at the end of processing
+            self.save_state(self.__store_loc)
+            pbar.close()
