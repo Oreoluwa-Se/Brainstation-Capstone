@@ -35,7 +35,7 @@ Here is a high-level overview of the directory structure of our project, organiz
 │   ├── architecture       # Model architecture specifics
 │   └── preprocess         # Data preprocessing utilities
 └── utils                  # Utility scripts and helper functions
-
+```
 
 ## 💻 Technical Mumbo-Jumbo
 
