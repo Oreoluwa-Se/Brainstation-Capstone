@@ -1,17 +1,16 @@
-from collections import Counter
-from typing import List, Pattern, Dict, Tuple, Any
-from tqdm import tqdm
-from dataclasses import dataclass, field
-from functools import lru_cache
-import regex as re
-import numpy as np
-import math
-import string
-import pickle
-import os
-import nltk
-from nltk.corpus import words
 from .load_and_batch import MetaData
+from collections import Counter
+from dataclasses import dataclass, field
+from nltk.corpus import words
+from tqdm import tqdm
+from typing import List, Pattern, Dict, Tuple, Any
+import math
+import nltk
+import numpy as np
+import os
+import pickle
+import regex as re
+import string
 
 nltk.download("words")
 
@@ -169,25 +168,24 @@ class TokCollector:
         if self.freq is not None:
             self.freq[item[0]] = freq_count
 
-    def remove_presence(self, key: Tuple[int, int]):
+    def remove_presence(self, key: Tuple[int, int], alt=None):
         # handles removal of key and prunes the list as-well
         if key in self.vocab:
             del self.vocab[key]
 
-        for c_pair in list(self.vocab.keys()):
-            if c_pair[0] == key[1] or c_pair[1] == key[0]:
-                self.vocab[c_pair] -= 1
-
-                # Check if we prune current pair
-                if self.vocab[c_pair] <= 0:
-                    del self.vocab[c_pair]
-
-                    if self.freq and c_pair in self.freq:
-                        del self.freq[c_pair]
-
         # Remove the current key we inserted previously
         if self.freq and key in self.freq:
             del self.freq[key]
+
+        c_vocab = self.vocab
+
+        for c_pair in list(c_vocab.keys()):
+            if c_pair[0] == key[1] or c_pair[1] == key[0]:
+                del self.vocab[c_pair]
+                del self.freq[c_pair]
+
+                if alt:
+                    del alt[c_pair]
 
     def tf_idf_dict(self, doc_size: int, total_words: int) -> Dict[Any, float]:
         if self.freq:
@@ -231,8 +229,9 @@ class Encoder:
         # base paired characters [token: count]
         self.__paired = TokCollector(args.IQR_Mult, args.IQR_Iter, add_freq=True)
         self.__init_paired()
-        # potential tokens [(token, token): count]
-        self.__potential = TokCollector(args.IQR_Mult, args.IQR_Iter, add_freq=True)
+
+        # for commmmon words
+        self.__common = TokCollector(args.IQR_Mult, args.IQR_Iter, add_freq=True)
 
         self.__target_context = args.target_context
         self.__store_loc = args.store_loc
@@ -250,6 +249,12 @@ class Encoder:
 
         self.__loaded = False
 
+    def __update_common_vocab(self, word):
+        if word not in self.__common.mapping:
+            self.__common.mapping[word] = self.__next_id
+            self.__common.vocab[self.__next_id] = 0
+            self.__next_id += 1
+
     def __update_special_toks(self, special_list: List[str]) -> None:
         if len(special_list) == 0:
             return
@@ -263,6 +268,13 @@ class Encoder:
 
     def add_special_words(self, words: List[str]):
         self.__update_special_toks(words)
+
+    def get_meta_tokens(self):
+
+        return {
+            key: self.__special.mapping[key]
+            for key in ["<|AMOUNT|>", "<|NUM|>", "<|DATE|>"]
+        }
 
     def __init_special(self, toks: List[str]):
         base = ["<|AMOUNT|>", "<|NUM|>", "<|DATE|>", "<|SOW|>", "<|EOW|>", "<|PAD|>"]
@@ -294,6 +306,7 @@ class Encoder:
     def __init_paired(self) -> None:
         # all possible begining of word and end of word characters
         characters = string.ascii_letters + string.digits
+
         for char in characters:
             idx = list(char.encode("utf-8"))[0]
             mapped_char = (self.__special.mapping["<|SOW|>"], idx)
@@ -370,13 +383,20 @@ class Encoder:
     @property
     def vocab_size(self):
         # returns the total length
+        # __base_chars represent base Ascii characters
         return (
-            self.__base.vocab_len + self.__paired.vocab_len + self.__special.vocab_len
+            self.__base_chars
+            + self.__paired.vocab_len
+            + self.__special.vocab_len
+            + self.__common.vocab_len
         )
 
     def word_to_code(self, text: str):
         if text in self.__special.mapping:
             return [self.__special.mapping[text]]
+
+        if text in self.__common.mapping:
+            return [self.__common.mapping[text]]
 
         return list(text.encode("utf-8"))
 
@@ -387,9 +407,11 @@ class Encoder:
         )
         tokens, verbose_str = [], []
         for word in self.__pattern.findall(text):
+            if word.isspace():
+                continue
+
             if (
-                word.isspace()
-                or len(list(word)) == 1
+                len(list(word)) == 1
                 or word in self.__special.mapping
                 or skip_pattern.match(word) is not None
             ):
@@ -405,8 +427,8 @@ class Encoder:
             for single_word in inner_split:
                 # tokenize common words seperately
                 if single_word.lower() in common_words:
-                    self.__update_special_toks([single_word])
-                    to_join.append(self.__special.mapping[single_word])
+                    self.__update_common_vocab(single_word)
+                    to_join.append(self.__common.mapping[single_word])
                     to_join_a.append(single_word)
                     continue
 
@@ -476,26 +498,60 @@ class Encoder:
     def __update_indv_tok_freq(self, token: int):
         # update the token frequency
         if token <= 255:
-            self.__base.add(token)
-            return
+            target_vocab = self.__base
+        elif token in self.__special.vocab:
+            target_vocab = self.__special
+        elif token in self.__common.vocab:
+            target_vocab = self.__common
+        else:
+            target_vocab = self.__paired
 
-        if token in self.__special.vocab:
-            self.__special.add(token)
-            return
-
-        self.__paired.add(token)
+        target_vocab.add(token)
 
     def __update_doc_tok_freq(self, token: int):
         # update the document frequency
         if token <= 255:
-            self.__base.update_freq(token)
-            return
+            target_vocab = self.__base
+        elif token in self.__special.vocab:
+            target_vocab = self.__special
+        elif token in self.__common.vocab:
+            target_vocab = self.__common
+        else:
+            target_vocab = self.__paired
 
-        if token in self.__special.vocab:
-            self.__special.update_freq(token)
-            return
+        target_vocab.update_freq(token)
 
-        self.__paired.update_freq(token)
+    def find_most_frequent_pairs(self, lst):
+        # Count the frequency of each adjacent pair, skipping those with elements in special_vocab
+        tok_collector = TokCollector()
+
+        for i in range(len(lst) - 1):
+            if (
+                lst[i] not in self.__special.vocab
+                and lst[i + 1] not in self.__special.vocab
+            ):
+                tok_collector.add((lst[i], lst[i + 1]))
+
+        if tok_collector.empty_vocab:
+            return [], None
+
+        # Here we use TokCollector's functionality to get bounds and decide on outliers
+        _, upper_bound = tok_collector.get_vocab_bounds()
+
+        if upper_bound <= 1.0:
+            return [], None
+
+        max_freq = max(tok_collector.vocab.values())
+
+        # Check if max_freq is an outlier
+        if max_freq > upper_bound:
+            most_frequent_pairs = [
+                pair for pair, count in tok_collector.vocab.items() if count == max_freq
+            ]
+        else:
+            most_frequent_pairs = []
+
+        return most_frequent_pairs, max_freq
 
     def __update_vocab(self, tok_list: List[int]) -> None:
         """
@@ -503,108 +559,59 @@ class Encoder:
         Also starts process for forming new pairs
 
         Args:
-            tok_list (List[int]): List ot tokens to be updated
+            tok_list (List[int]): List of tokens to be updated
         """
         loop_track = set()
-        list_length = len(tok_list)
 
-        for idx, curr_tok in enumerate(tok_list):
-            pair = (curr_tok,)
+        for idx in range(len(tok_list)):
+            curr_tok, s_pair = tok_list[idx], (tok_list[idx],)
 
-            # Handling existing tokens
-            if pair not in self.__run_pair_track:
+            if s_pair not in self.__run_pair_track:
                 self.__update_indv_tok_freq(curr_tok)
 
-                if pair not in loop_track:
+                if s_pair not in loop_track:
                     self.__update_doc_tok_freq(curr_tok)
 
-                loop_track.add(pair)
+                loop_track.add(s_pair)
 
-            # Avoid merging special tokens.. easy for identifying later
-            if (
-                curr_tok in self.__special.vocab
-                or tok_list[idx + 1] in self.__special.vocab
-            ):
-                continue
-
-            tok_pair = (curr_tok, tok_list[idx + 1]) if idx < list_length - 1 else None
-            if tok_pair is not None and tok_pair not in self.__run_pair_track:
-                self.__potential.add(tok_pair)  # update pair frequency
-
-                if tok_pair not in loop_track:  # update pair document frequency
-                    self.__potential.update_freq(tok_pair)
-
-                loop_track.add(tok_pair)
-
-        # update run pair track to be used in next loop
+        # Update run pair track to be used in next loop
         self.__run_pair_track.update(loop_track)
 
     def __update_info(self, new_info: List[Tuple[int, int]], count: int = 1):
         for key in new_info:
-            # update paired
-            self.__paired.update_mappings(
-                (key, count), self.__next_id, self.__potential.freq[key]
-            )
-
+            self.__paired.update_mappings((key, count), self.__next_id, 0)
             self.__next_id += 1
 
-            # remove or decrement presence
-            self.__potential.remove_presence(key)
-
     def get_count(self, token: int) -> int:
-        # returns count of token
+        # Return count of token directly for base vocab
         if token <= 255:
-            return self.__base.vocab[token]
+            return self.__base.vocab.get(token, 0)
 
-        count = self.__special.vocab.get(token, None)
-        if count is not None:
-            return count
-
-        count = self.__paired.vocab.get(token, None)
-        if count is not None:
-            return count
+        # Iterate through other vocabularies to find the token count
+        for vocab in [self.__special.vocab, self.__paired.vocab, self.__common.vocab]:
+            count = vocab.get(token)
+            if count is not None:
+                return count
 
         return 0
 
-    def __bpe_update_scheme(self):
-        if self.__potential.empty_vocab:
-            return
-
-        # Find the maximum count directly
-        max_count = self.__potential.vocab.most_common(1)[0][1]
-
-        if max_count == 1:
-            return
-
-        to_process = [
-            pair for pair, count in self.__potential.vocab.items() if count == max_count
+    def __bpe_update_scheme(self, opts: List[Tuple[int, int]], max_count):
+        # Calculate root_counts and filter by max_count in one step, then sort
+        root_counts = [
+            (pair, self.get_count(pair[0]) + self.get_count(pair[1])) for pair in opts
         ]
+        sorted_pairs = sorted(root_counts, key=lambda x: x[1], reverse=True)
 
-        # Refine by number of times root elements appear, if needed
-        if len(to_process) > 1:
-            root_counts = [
-                (pair, self.get_count(pair[0]) + self.get_count(pair[1]))
-                for pair in to_process
-            ]
-            max_root = max(root_counts, key=lambda x: x[1])[1]
-            to_process = [
-                pair for pair, root_sum in root_counts if root_sum == max_root
-            ]
-
-        # Ensure unique pairs if there are multiple candidates
-        if len(to_process) > 1:
-            unique_pairs = []
-            unique_toks = set()
-
-            for pair in to_process:
-                if pair[0] not in unique_toks and pair[1] not in unique_toks:
-                    unique_pairs.append(pair)
-                    unique_toks.update(pair)
-
-            to_process = unique_pairs
+        # Filter by unique counts
+        unique_pairs = []
+        unique_toks = set()
+        for pair, _ in sorted_pairs:
+            if pair[0] not in unique_toks and pair[1] not in unique_toks:
+                unique_pairs.append(pair)
+                unique_toks.update(pair)
 
         # Now we update the information real-time
-        self.__update_info(to_process, max_count)
+        self.__update_info(unique_pairs, max_count)
 
     def get_token(self, pair: Tuple[int, int]) -> int:
         if len(pair) == 1:
@@ -658,7 +665,6 @@ class Encoder:
         self.__total_words += curr_size
         # These help track results per run
         self.__run_pair_track.clear()
-        self.__potential.clear()
 
         while True:
             # if merged version already fits the context window
@@ -666,7 +672,12 @@ class Encoder:
                 break
 
             self.__update_vocab(new_list)
-            self.__bpe_update_scheme()
+            opts, max_count = self.find_most_frequent_pairs(new_list)
+            if len(opts) == 0 or max_count == 1:
+                break
+
+            # print(opts)
+            self.__bpe_update_scheme(opts, max_count)
             new_list = self.__merge_known_pairs(new_list)
 
             # no further improvements can be made
@@ -689,16 +700,25 @@ class Encoder:
         return encoded
 
     def save_state(self, location: str):
-        directory = os.path.join(location, "BPE_Info")
+        if location.endswith(".pkl"):
+            filepath = location
+            directory = os.path.dirname(filepath)
+        else:
+            directory = os.path.join(location, "BPE_Info")
+            filepath = os.path.join(directory, "bpe_state.pkl")
+
         if not os.path.exists(directory):
             os.makedirs(directory)
 
-        filepath = os.path.join(directory, "bpe_state.pkl")
         with open(filepath, "wb") as file:
             pickle.dump(self.__dict__, file)
 
     def load_state(self, location: str):
-        filepath = os.path.join(location, "BPE_info", "bpe_state.pkl")
+        if location.endswith(".pkl"):
+            filepath = location
+        else:
+            filepath = os.path.join(location, "BPE_Info", "bpe_state.pkl")
+
         if os.path.exists(filepath):
             with open(filepath, "rb") as file:
                 state = pickle.load(file)
